@@ -9,6 +9,13 @@ const APP_KEYS = {
   socialLinks: "app296_social_links",
   session: "app296_session",
   loginHistory: "app296_login_history",
+  candidatesCache: "app296_candidates_cache",
+  companiesCache: "app296_companies_cache",
+  agentsCache: "app296_agents_cache",
+  pendingCandidates: "app296_pending_candidates",
+  pendingCandidateDeletes: "app296_pending_candidate_deletes",
+  pendingCompanies: "app296_pending_companies",
+  pendingAgents: "app296_pending_agents",
 };
 
 const defaultSettings = {
@@ -613,6 +620,7 @@ let installCardDismissed = false;
 const runtimeStore = {};
 let applicantsSyncTimeout = null;
 let applicantRefreshTimer = null;
+let pendingSupabaseSyncPromise = null;
 const STAFF_IDLE_LIMIT_MS = 15 * 60 * 1000;
 const LOGIN_HISTORY_LIMIT = 400;
 let idleLogoutTimer = null;
@@ -810,41 +818,467 @@ function restoreSessionFromStorage() {
   return true;
 }
 
-async function fetchApplicantsFromServer() {
-  try {
-    const resp = await fetch("/.netlify/functions/getApplicants");
-    if (!resp.ok) return [];
-    const payload = await resp.json();
-    return Array.isArray(payload.applicants) ? payload.applicants : [];
-  } catch {
-    return [];
-  }
+function supabaseClient() {
+  return window.appSupabase?.getClient?.() || null;
 }
 
-async function saveApplicantsToServer(applicantsList) {
-  try {
-    await fetch("/.netlify/functions/saveApplicant", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-app-role": appRoleHeader(),
-      },
-      body: JSON.stringify({
-        applicants: applicantsList,
-        actorName: state.user?.staffName || "",
-        actorEmail: state.user?.id || "",
-      }),
-    });
-  } catch {
-    // Keep local runtime state if server is temporarily unreachable.
-  }
+function hasSupabaseClient() {
+  return !!supabaseClient();
+}
+
+function browserOnline() {
+  return typeof navigator === "undefined" || navigator.onLine !== false;
+}
+
+function cachedList(key) {
+  const list = safeStorageGet(key, []);
+  return Array.isArray(list) ? list : [];
+}
+
+function cacheList(key, value) {
+  safeStorageSet(key, Array.isArray(value) ? value : []);
 }
 
 function queueApplicantsSync(applicantsList) {
   if (applicantsSyncTimeout) clearTimeout(applicantsSyncTimeout);
   applicantsSyncTimeout = setTimeout(() => {
-    saveApplicantsToServer(applicantsList);
-  }, 250);
+    saveApplicantsToServer(applicantsList).catch(() => {});
+  }, 400);
+}
+
+function cleanDateInput(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function todayDateInput() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function mergeCustomerCacheRecord(onlineItem, cachedItem) {
+  if (!cachedItem || typeof cachedItem !== "object") return onlineItem;
+  return {
+    ...cachedItem,
+    ...onlineItem,
+    documents: cachedItem.documents || onlineItem.documents || {},
+    linkedDocumentIds: toArray(cachedItem.linkedDocumentIds).length ? toArray(cachedItem.linkedDocumentIds) : toArray(onlineItem.linkedDocumentIds),
+    linkedPaymentIds: toArray(cachedItem.linkedPaymentIds).length ? toArray(cachedItem.linkedPaymentIds) : toArray(onlineItem.linkedPaymentIds),
+  };
+}
+
+function normalizeCompanyRecord(row = {}) {
+  return {
+    id: row.id || "",
+    name: String(row.name || "").trim(),
+    phone: String(row.phone || "").trim(),
+    address: String(row.address || "").trim(),
+    description: String(row.description || "").trim(),
+    created_at: row.created_at || "",
+  };
+}
+
+function normalizeAgentRecord(row = {}, index = 0) {
+  return {
+    id: row.id || "",
+    agent_code: String(row.agent_code || row.agentCode || "").trim() || String(index + 1).padStart(4, "0"),
+    name: String(row.name || "").trim(),
+    email: String(row.email || "").trim(),
+    phone: String(row.phone || "").trim(),
+    role: String(row.role || "agent").trim() || "agent",
+    created_at: row.created_at || "",
+  };
+}
+
+function mergeCompanyProfilesWithRemote(remoteCompanies) {
+  const remoteList = Array.isArray(remoteCompanies) ? remoteCompanies : [];
+  const remoteByName = new Map(remoteList.map((item) => [String(item.name || "").trim().toLowerCase(), item]));
+  const aliases = {
+    travel: ["travel nama"],
+    umeed: ["umeed e rozgar"],
+    group296: ["296 group", "296 group (admin internal)"],
+  };
+  const merged = companyProfiles().map((profile) => {
+    const fallbackName = String(profile.name || "").trim().toLowerCase();
+    const matchNames = [fallbackName, ...(aliases[profile.key] || [])];
+    const remote = matchNames.map((name) => remoteByName.get(name)).find(Boolean);
+    if (!remote) return profile;
+    return {
+      ...profile,
+      remoteId: remote.id || profile.remoteId || "",
+      name: remote.name || profile.name,
+      phone: remote.phone || profile.phone,
+      description: remote.description || profile.description,
+    };
+  });
+  runtimeStore[APP_KEYS.companyProfiles] = cloneValue(merged);
+  safeStorageSet(APP_KEYS.companyProfiles, merged);
+  return merged;
+}
+
+async function fetchSupabaseCompanies() {
+  const client = supabaseClient();
+  if (!client || !browserOnline()) return cachedList(APP_KEYS.companiesCache);
+  const { data, error } = await client
+    .from("companies")
+    .select("id, name, phone, address, description, created_at")
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  const companies = Array.isArray(data) ? data.map(normalizeCompanyRecord).filter((item) => item.name) : [];
+  cacheList(APP_KEYS.companiesCache, companies);
+  return companies;
+}
+
+async function ensureSupabaseCompany(companyLike = {}) {
+  const name = String(companyLike.name || "").trim();
+  if (!name) return null;
+  const client = supabaseClient();
+  if (!client || !browserOnline()) return null;
+  const payload = {
+    name,
+    phone: String(companyLike.phone || "").trim() || null,
+    address: String(companyLike.address || "").trim() || null,
+    description: String(companyLike.description || "").trim() || null,
+  };
+  const { data, error } = await client
+    .from("companies")
+    .upsert(payload, { onConflict: "name" })
+    .select("id, name, phone, address, description, created_at")
+    .single();
+  if (error) throw error;
+  return normalizeCompanyRecord(data || payload);
+}
+
+async function saveCompaniesToSupabase(companyProfilesList) {
+  const profiles = Array.isArray(companyProfilesList) ? companyProfilesList : [];
+  const companyRows = profiles.map((company) => ({
+    id: company.remoteId || company.id || undefined,
+    name: String(company.name || "").trim(),
+    phone: String(company.phone || "").trim(),
+    address: String(company.address || "").trim(),
+    description: String(company.description || "").trim(),
+  })).filter((company) => company.name);
+
+  cacheList(APP_KEYS.companiesCache, companyRows);
+  if (!hasSupabaseClient() || !browserOnline()) {
+    safeStorageSet(APP_KEYS.pendingCompanies, companyRows);
+    return { status: "local", companies: companyRows };
+  }
+
+  const savedCompanies = [];
+  try {
+    for (const company of companyRows) {
+      const saved = await ensureSupabaseCompany(company);
+      if (saved) savedCompanies.push(saved);
+    }
+    cacheList(APP_KEYS.companiesCache, savedCompanies);
+    safeStorageRemove(APP_KEYS.pendingCompanies);
+    runtimeStore.crmCompanies = cloneValue(savedCompanies);
+    mergeCompanyProfilesWithRemote(savedCompanies);
+    return { status: "online", companies: savedCompanies };
+  } catch (error) {
+    safeStorageSet(APP_KEYS.pendingCompanies, companyRows);
+    return { status: "local", companies: companyRows, error };
+  }
+}
+
+async function findCountryIdByName(name) {
+  const normalized = String(name || "").trim();
+  if (!normalized) return null;
+  const cache = runtimeStore.crmCountryIdCache instanceof Map ? runtimeStore.crmCountryIdCache : new Map();
+  if (cache.has(normalized.toLowerCase())) return cache.get(normalized.toLowerCase());
+  const client = supabaseClient();
+  if (!client || !browserOnline()) return null;
+  try {
+    const { data, error } = await client
+      .from("countries")
+      .select("id, name")
+      .ilike("name", normalized)
+      .limit(1)
+      .maybeSingle();
+    if (error) return null;
+    const id = data?.id || null;
+    cache.set(normalized.toLowerCase(), id);
+    runtimeStore.crmCountryIdCache = cache;
+    return id;
+  } catch {
+    return null;
+  }
+}
+
+async function upsertSupabaseApplicantRecord(applicant) {
+  const client = supabaseClient();
+  if (!client) throw new Error("Supabase is not configured.");
+
+  const current = { ...applicant };
+  let candidateId = String(current.remoteCandidateId || "").trim();
+  let applicationRowId = String(current.remoteApplicationId || "").trim();
+
+  if (current.appId && (!candidateId || !applicationRowId)) {
+    const { data: existingApp } = await client
+      .from("applications")
+      .select("id, candidate_id")
+      .eq("application_id", current.appId)
+      .maybeSingle();
+    if (existingApp) {
+      applicationRowId = existingApp.id || applicationRowId;
+      candidateId = existingApp.candidate_id || candidateId;
+    }
+  }
+
+  const companyName = String(current.companyName || current.serviceCompany || "").trim();
+  const companyRecord = companyName ? await ensureSupabaseCompany({ name: companyName }) : null;
+  const countryId = await findCountryIdByName(current.country || "");
+  const candidatePayload = {
+    ...(candidateId ? { id: candidateId } : {}),
+    name: String(current.name || "Customer").trim() || "Customer",
+    father_name: String(current.fatherName || "").trim() || null,
+    passport_number: String(current.passport || current.passportNumber || "").trim() || null,
+    phone: String(current.contact || current.phone || "").trim() || null,
+    email: String(current.email || "").trim() || null,
+    country_preference: countryId,
+    job_category: String(current.tradeCategory || current.jobCategory || "").trim() || null,
+    agent_id: String(current.agentId || "").trim() || null,
+    status: String(current.status || "New Lead").trim() || "New Lead",
+  };
+
+  let candidateResponse;
+  if (candidatePayload.id) {
+    const { data, error } = await client
+      .from("candidates")
+      .upsert(candidatePayload, { onConflict: "id" })
+      .select("id, name, father_name, passport_number, phone, email, job_category, agent_id, status, created_at")
+      .single();
+    if (error) throw error;
+    candidateResponse = data;
+  } else {
+    const { data, error } = await client
+      .from("candidates")
+      .insert(candidatePayload)
+      .select("id, name, father_name, passport_number, phone, email, job_category, agent_id, status, created_at")
+      .single();
+    if (error) throw error;
+    candidateResponse = data;
+  }
+
+  const applicationPayload = {
+    ...(applicationRowId ? { id: applicationRowId } : {}),
+    application_id: String(current.appId || "").trim() || createApplicationId(companyName || "296 Group", new Date()),
+    candidate_id: candidateResponse.id,
+    company_id: companyRecord?.id || null,
+    stage: String(current.stage || "Application").trim() || "Application",
+    status: String(current.status || candidateResponse.status || "Applied").trim() || "Applied",
+    application_date: cleanDateInput(current.applyDate || current.createdAt) || todayDateInput(),
+    travel_date: cleanDateInput(current.travelDate),
+    total_payment: toNumber(current.totalPayment),
+    advance_payment: toNumber(current.advancePayment),
+    refund_payment: toNumber(current.refundPayment),
+    remaining_payment: calculateRemaining(current.totalPayment, current.advancePayment, current.refundPayment),
+  };
+
+  let applicationResponse;
+  if (applicationPayload.id) {
+    const { data, error } = await client
+      .from("applications")
+      .upsert(applicationPayload, { onConflict: "id" })
+      .select("id, application_id, stage, status, application_date, travel_date, total_payment, advance_payment, refund_payment, remaining_payment, created_at")
+      .single();
+    if (error) throw error;
+    applicationResponse = data;
+  } else {
+    const { data, error } = await client
+      .from("applications")
+      .insert(applicationPayload)
+      .select("id, application_id, stage, status, application_date, travel_date, total_payment, advance_payment, refund_payment, remaining_payment, created_at")
+      .single();
+    if (error) throw error;
+    applicationResponse = data;
+  }
+
+  return {
+    ...current,
+    appId: applicationResponse.application_id,
+    remoteCandidateId: candidateResponse.id,
+    remoteApplicationId: applicationResponse.id,
+    name: candidateResponse.name || current.name || "",
+    fatherName: candidateResponse.father_name || current.fatherName || "",
+    passport: candidateResponse.passport_number || current.passport || "",
+    contact: candidateResponse.phone || current.contact || "",
+    email: candidateResponse.email || current.email || "",
+    tradeCategory: candidateResponse.job_category || current.tradeCategory || "",
+    agentId: candidateResponse.agent_id || current.agentId || "",
+    status: applicationResponse.status || current.status || "",
+    stage: applicationResponse.stage || current.stage || "",
+    applyDate: applicationResponse.application_date || current.applyDate || "",
+    travelDate: applicationResponse.travel_date || current.travelDate || "",
+    totalPayment: Number(applicationResponse.total_payment || 0),
+    advancePayment: Number(applicationResponse.advance_payment || 0),
+    refundPayment: Number(applicationResponse.refund_payment || 0),
+    remainingPayment: Number(applicationResponse.remaining_payment || 0),
+    companyName: companyRecord?.name || companyName || current.companyName || "",
+    serviceCompany: current.serviceCompany || companyRecord?.name || companyName || "",
+    createdAt: applicationResponse.created_at || candidateResponse.created_at || current.createdAt || new Date().toISOString(),
+  };
+}
+
+function mapSupabaseApplicationRow(row, index, cachedByAppId) {
+  const candidate = row.candidates || {};
+  const company = row.companies || {};
+  const mapped = {
+    remoteApplicationId: row.id || "",
+    remoteCandidateId: candidate.id || "",
+    serial: index + 1,
+    appId: row.application_id || "",
+    name: candidate.name || "",
+    fatherName: candidate.father_name || "",
+    passport: candidate.passport_number || "",
+    contact: candidate.phone || "",
+    phone: candidate.phone || "",
+    email: candidate.email || "",
+    tradeCategory: candidate.job_category || "",
+    agentId: candidate.agent_id || "",
+    status: row.status || candidate.status || "New Lead",
+    stage: row.stage || "Application",
+    applyDate: row.application_date || "",
+    travelDate: row.travel_date || "",
+    totalPayment: Number(row.total_payment || 0),
+    advancePayment: Number(row.advance_payment || 0),
+    refundPayment: Number(row.refund_payment || 0),
+    remainingPayment: Number(row.remaining_payment || 0),
+    companyName: company.name || "",
+    serviceCompany: company.name || "",
+    createdAt: row.created_at || candidate.created_at || "",
+  };
+  const cached = cachedByAppId.get(String(mapped.appId || "").toLowerCase());
+  return mergeCustomerCacheRecord(mapped, cached);
+}
+
+async function fetchApplicantsFromServer() {
+  const client = supabaseClient();
+  const cached = cachedList(APP_KEYS.candidatesCache);
+  if (!client || !browserOnline()) return cached;
+  try {
+    const { data: applicationRows, error: applicationError } = await client
+      .from("applications")
+      .select("id, application_id, candidate_id, company_id, stage, status, application_date, travel_date, total_payment, advance_payment, refund_payment, remaining_payment, created_at")
+      .order("created_at", { ascending: false });
+    if (applicationError) throw applicationError;
+
+    const candidateIds = Array.from(new Set((applicationRows || []).map((row) => row.candidate_id).filter(Boolean)));
+    const companyIds = Array.from(new Set((applicationRows || []).map((row) => row.company_id).filter(Boolean)));
+
+    const { data: candidateRows, error: candidateError } = candidateIds.length
+      ? await client
+        .from("candidates")
+        .select("id, name, father_name, passport_number, phone, email, job_category, agent_id, status, created_at")
+        .in("id", candidateIds)
+      : { data: [], error: null };
+    if (candidateError) throw candidateError;
+
+    const { data: companyRows, error: companyError } = companyIds.length
+      ? await client
+        .from("companies")
+        .select("id, name, phone, description")
+        .in("id", companyIds)
+      : { data: [], error: null };
+    if (companyError) throw companyError;
+
+    const candidateMap = new Map((candidateRows || []).map((row) => [row.id, row]));
+    const companyMap = new Map((companyRows || []).map((row) => [row.id, row]));
+    const cacheMap = new Map(cached.map((item) => [String(item.appId || "").toLowerCase(), item]));
+    const applicants = Array.isArray(applicationRows)
+      ? applicationRows.map((row, index) => mapSupabaseApplicationRow({
+        ...row,
+        candidates: candidateMap.get(row.candidate_id) || {},
+        companies: companyMap.get(row.company_id) || {},
+      }, index, cacheMap))
+      : [];
+    cacheList(APP_KEYS.candidatesCache, applicants);
+    return applicants;
+  } catch {
+    return cached;
+  }
+}
+
+async function saveApplicantsToServer(applicantsList) {
+  const applicants = Array.isArray(applicantsList) ? applicantsList : [];
+  cacheList(APP_KEYS.candidatesCache, applicants);
+  if (!hasSupabaseClient() || !browserOnline()) {
+    safeStorageSet(APP_KEYS.pendingCandidates, applicants);
+    return { status: "local", applicants };
+  }
+  try {
+    const synced = [];
+    for (const applicant of applicants) {
+      synced.push(await upsertSupabaseApplicantRecord(applicant));
+    }
+    synced.forEach((item, index) => {
+      item.serial = index + 1;
+    });
+    runtimeStore[APP_KEYS.customers] = cloneValue(synced);
+    cacheList(APP_KEYS.candidatesCache, synced);
+    safeStorageRemove(APP_KEYS.pendingCandidates);
+    return { status: "online", applicants: synced };
+  } catch (error) {
+    safeStorageSet(APP_KEYS.pendingCandidates, applicants);
+    return { status: "local", applicants, error };
+  }
+}
+
+function queuePendingApplicantDelete(applicationId) {
+  const pending = cachedList(APP_KEYS.pendingCandidateDeletes);
+  const next = Array.from(new Set([...pending, String(applicationId || "").trim()].filter(Boolean)));
+  safeStorageSet(APP_KEYS.pendingCandidateDeletes, next);
+}
+
+async function deleteApplicantFromSupabase(applicant) {
+  const applicationId = String(applicant?.appId || "").trim();
+  if (!applicationId) return { status: "local" };
+  if (!hasSupabaseClient() || !browserOnline()) {
+    queuePendingApplicantDelete(applicationId);
+    return { status: "local" };
+  }
+  try {
+    const client = supabaseClient();
+    const { data: existing, error: lookupError } = await client
+      .from("applications")
+      .select("id, candidate_id")
+      .eq("application_id", applicationId)
+      .maybeSingle();
+    if (lookupError) throw lookupError;
+    if (existing?.id) {
+      const { error: deleteAppError } = await client
+        .from("applications")
+        .delete()
+        .eq("id", existing.id);
+      if (deleteAppError) throw deleteAppError;
+
+      if (existing.candidate_id) {
+        const { count, error: countError } = await client
+          .from("applications")
+          .select("id", { count: "exact", head: true })
+          .eq("candidate_id", existing.candidate_id);
+        if (countError) throw countError;
+        if (!count) {
+          const { error: deleteCandidateError } = await client
+            .from("candidates")
+            .delete()
+            .eq("id", existing.candidate_id);
+          if (deleteCandidateError) throw deleteCandidateError;
+        }
+      }
+    }
+    const pending = cachedList(APP_KEYS.pendingCandidateDeletes).filter((item) => item !== applicationId);
+    if (pending.length) safeStorageSet(APP_KEYS.pendingCandidateDeletes, pending);
+    else safeStorageRemove(APP_KEYS.pendingCandidateDeletes);
+    return { status: "online" };
+  } catch (error) {
+    queuePendingApplicantDelete(applicationId);
+    return { status: "local", error };
+  }
 }
 
 function appRoleHeader() {
@@ -913,22 +1347,169 @@ async function fetchDashboardMetrics() {
 
 async function fetchCrmReferences() {
   try {
-    const payload = await crmFetch("/.netlify/functions/crm-reference");
+    const companies = await fetchSupabaseCompanies();
     return {
-      countries: Array.isArray(payload.countries) ? payload.countries : [],
-      companies: Array.isArray(payload.companies) ? payload.companies : [],
+      countries: ALL_COUNTRIES,
+      companies,
     };
   } catch {
-    return { countries: [], companies: [] };
+    return {
+      countries: ALL_COUNTRIES,
+      companies: cachedList(APP_KEYS.companiesCache),
+    };
   }
 }
 
 async function fetchCrmAgents() {
+  const client = supabaseClient();
+  const cached = cachedList(APP_KEYS.agentsCache);
+  if (!client || !browserOnline()) return cached;
   try {
-    const payload = await crmFetch("/.netlify/functions/crm-agents");
-    return Array.isArray(payload.agents) ? payload.agents : [];
+    const { data, error } = await client
+      .from("agents")
+      .select("id, name, email, phone, role, created_at")
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+    const agents = Array.isArray(data) ? data.map((item, index) => normalizeAgentRecord(item, index)).filter((item) => item.name) : [];
+    cacheList(APP_KEYS.agentsCache, agents);
+    return agents;
   } catch {
-    return [];
+    return cached;
+  }
+}
+
+function mergeAgentIntoRuntime(agent) {
+  const list = Array.isArray(runtimeStore.crmAgents) ? [...runtimeStore.crmAgents] : [];
+  const idx = list.findIndex((item) => String(item.id || "") === String(agent.id || ""));
+  if (idx >= 0) list[idx] = { ...list[idx], ...agent };
+  else list.unshift(agent);
+  const normalized = list.map((item, index) => normalizeAgentRecord(item, index));
+  runtimeStore.crmAgents = normalized;
+  cacheList(APP_KEYS.agentsCache, normalized);
+  return normalized;
+}
+
+function queuePendingAgent(agent) {
+  const pending = cachedList(APP_KEYS.pendingAgents);
+  const matchIndex = pending.findIndex((item) =>
+    (agent.id && String(item.id || "") === String(agent.id || ""))
+    || (agent.email && String(item.email || "").toLowerCase() === String(agent.email || "").toLowerCase())
+  );
+  if (matchIndex >= 0) pending[matchIndex] = { ...pending[matchIndex], ...agent };
+  else pending.unshift(agent);
+  safeStorageSet(APP_KEYS.pendingAgents, pending);
+}
+
+async function saveAgentToSupabase(agentInput) {
+  const agent = {
+    id: String(agentInput.id || "").trim(),
+    name: String(agentInput.name || "").trim(),
+    email: String(agentInput.email || "").trim(),
+    phone: String(agentInput.phone || "").trim(),
+    role: String(agentInput.role || "agent").trim() || "agent",
+    agent_code: String(agentInput.agentCode || agentInput.agent_code || "").trim() || localAgentCode(),
+  };
+  if (!agent.name) {
+    return { status: "local", agent, error: new Error("Agent name is required.") };
+  }
+
+  mergeAgentIntoRuntime(agent);
+  if (!hasSupabaseClient() || !browserOnline()) {
+    queuePendingAgent(agent);
+    return { status: "local", agent };
+  }
+
+  try {
+    const payload = {
+      ...(agent.id && !String(agent.id).startsWith("local_") ? { id: agent.id } : {}),
+      name: agent.name,
+      email: agent.email || null,
+      phone: agent.phone || null,
+      role: agent.role || "agent",
+    };
+
+    let queryResult;
+    if (payload.id) {
+      queryResult = await supabaseClient()
+        .from("agents")
+        .upsert(payload, { onConflict: "id" })
+        .select("id, name, email, phone, role, created_at")
+        .single();
+    } else if (payload.email) {
+      queryResult = await supabaseClient()
+        .from("agents")
+        .upsert(payload, { onConflict: "email" })
+        .select("id, name, email, phone, role, created_at")
+        .single();
+    } else {
+      queryResult = await supabaseClient()
+        .from("agents")
+        .insert(payload)
+        .select("id, name, email, phone, role, created_at")
+        .single();
+    }
+
+    if (queryResult.error) throw queryResult.error;
+    const saved = normalizeAgentRecord({ ...queryResult.data, agent_code: agent.agent_code }, 0);
+    mergeAgentIntoRuntime(saved);
+    const pending = cachedList(APP_KEYS.pendingAgents).filter((item) =>
+      !(
+        (saved.id && String(item.id || "") === String(saved.id || ""))
+        || (saved.email && String(item.email || "").toLowerCase() === String(saved.email || "").toLowerCase())
+        || (agent.email && String(item.email || "").toLowerCase() === String(agent.email || "").toLowerCase())
+      )
+    );
+    if (pending.length) safeStorageSet(APP_KEYS.pendingAgents, pending);
+    else safeStorageRemove(APP_KEYS.pendingAgents);
+    return { status: "online", agent: saved };
+  } catch (error) {
+    queuePendingAgent(agent);
+    return { status: "local", agent, error };
+  }
+}
+
+async function syncPendingSupabaseData() {
+  if (pendingSupabaseSyncPromise) return pendingSupabaseSyncPromise;
+  pendingSupabaseSyncPromise = (async () => {
+    if (!hasSupabaseClient() || !browserOnline()) return false;
+
+    const pendingDeletes = cachedList(APP_KEYS.pendingCandidateDeletes);
+    for (const applicationId of pendingDeletes) {
+      await deleteApplicantFromSupabase({ appId: applicationId });
+    }
+
+    const pendingCompanies = cachedList(APP_KEYS.pendingCompanies);
+    if (pendingCompanies.length) {
+      await saveCompaniesToSupabase(
+        pendingCompanies.map((item, index) => ({
+          key: item.key || `company_${index + 1}`,
+          remoteId: item.id || "",
+          name: item.name || "",
+          phone: item.phone || "",
+          address: item.address || "",
+          description: item.description || "",
+          services: [],
+        }))
+      );
+    }
+
+    const pendingAgents = cachedList(APP_KEYS.pendingAgents);
+    for (const agent of pendingAgents) {
+      await saveAgentToSupabase(agent);
+    }
+
+    const pendingCandidates = cachedList(APP_KEYS.pendingCandidates);
+    if (pendingCandidates.length) {
+      await saveApplicantsToServer(pendingCandidates);
+    }
+
+    return true;
+  })();
+
+  try {
+    return await pendingSupabaseSyncPromise;
+  } finally {
+    pendingSupabaseSyncPromise = null;
   }
 }
 
@@ -972,12 +1553,14 @@ function load(key, fallback) {
   if (Object.prototype.hasOwnProperty.call(runtimeStore, key)) {
     return cloneValue(runtimeStore[key]);
   }
-  return cloneValue(fallback);
+  return safeStorageGet(key, fallback);
 }
 
 function save(key, value) {
   runtimeStore[key] = cloneValue(value);
+  safeStorageSet(key, value);
   if (key === APP_KEYS.customers) {
+    cacheList(APP_KEYS.candidatesCache, Array.isArray(value) ? value : []);
     queueApplicantsSync(Array.isArray(value) ? value : []);
   }
 }
@@ -1673,7 +2256,8 @@ async function findOrCreateCustomerLoginRecord(query) {
 
   all.push(customer);
   save(APP_KEYS.customers, all);
-  await saveApplicantsToServer(all);
+  const saveResult = await saveApplicantsToServer(all);
+  const persistedCustomer = (saveResult.applicants || []).find((item) => item.appId === customer.appId) || customer;
 
   const note = notifications();
   note.unshift({
@@ -1682,7 +2266,7 @@ async function findOrCreateCustomerLoginRecord(query) {
   });
   save(APP_KEYS.notifications, note);
 
-  return { customer, created: true };
+  return { customer: persistedCustomer, created: true };
 }
 
 function toNumber(v) {
@@ -2281,7 +2865,7 @@ function renderPublicHome() {
       const all = customers();
       all.push(obj);
       save(APP_KEYS.customers, all);
-      await saveApplicantsToServer(all);
+      const saveResult = await saveApplicantsToServer(all);
       const n = notifications();
       n.unshift({
         at: new Date().toISOString(),
@@ -2289,7 +2873,7 @@ function renderPublicHome() {
       });
       save(APP_KEYS.notifications, n);
       await autoDriveBackupIfEnabled();
-      alert(`Application submitted successfully. Your Application ID: ${obj.appId}`);
+      alert(`${saveResult.status === "online" ? "Saved online successfully" : "Saved locally, pending sync"}. Application ID: ${obj.appId}`);
       refs.publicApplyForm.reset();
       selectedServiceInput.value = "";
       boughtServiceInput.value = "";
@@ -2945,7 +3529,7 @@ async function addCustomer(form) {
     all.push(obj);
   }
   save(APP_KEYS.customers, all);
-  await saveApplicantsToServer(all);
+  const saveResult = await saveApplicantsToServer(all);
 
   const n = notifications();
   n.unshift({
@@ -2954,7 +3538,7 @@ async function addCustomer(form) {
   });
   save(APP_KEYS.notifications, n);
 
-  alert(`${editIndex >= 0 ? "Updated" : "Saved"}. Application ID: ${obj.appId}`);
+  alert(`${saveResult.status === "online" ? "Saved online successfully" : "Saved locally, pending sync"}. Application ID: ${obj.appId}`);
   await autoDriveBackupIfEnabled();
   renderTab();
 }
@@ -3422,7 +4006,7 @@ function loadCustomerIntoFormBySerial(serial, form) {
   return true;
 }
 
-function deleteCustomer(serial) {
+async function deleteCustomer(serial) {
   if (state.user?.role === "staff" && !state.user?.permissions?.canDelete) {
     alert("Your staff role is not allowed to delete records.");
     return;
@@ -3436,6 +4020,7 @@ function deleteCustomer(serial) {
   all.splice(index, 1);
   all.forEach((item, i) => { item.serial = i + 1; });
   save(APP_KEYS.customers, all);
+  const deleteResult = await deleteApplicantFromSupabase(c);
 
   const n = notifications();
   n.unshift({
@@ -3444,6 +4029,7 @@ function deleteCustomer(serial) {
   });
   save(APP_KEYS.notifications, n);
   autoDriveBackupIfEnabled();
+  alert(deleteResult.status === "online" ? "Saved online successfully" : "Saved locally, pending sync");
   renderTab();
 }
 
@@ -3994,29 +4580,11 @@ function renderApplications() {
         all[idx].status = statusEl.value;
         all[idx].travelDate = travelEl.value;
         save(APP_KEYS.customers, all);
-        try {
-          await crmFetch("/.netlify/functions/crm-applications", {
-            method: "POST",
-            body: JSON.stringify({
-              application: {
-                applicationId: all[idx].appId,
-                stage: all[idx].stage,
-                status: all[idx].status,
-                travelDate: all[idx].travelDate,
-                totalPayment: all[idx].totalPayment,
-                advancePayment: all[idx].advancePayment,
-                refundPayment: all[idx].refundPayment,
-                remainingPayment: all[idx].remainingPayment,
-              },
-            }),
-          });
-        } catch {
-          // Local state remains available even if backend update fails.
-        }
+        const saveResult = await saveApplicantsToServer(all);
         const n = notifications();
         n.unshift({ at: new Date().toISOString(), text: `Application updated: ${all[idx].name} (${all[idx].appId})` });
         save(APP_KEYS.notifications, n);
-        alert("Application updated.");
+        alert(saveResult.status === "online" ? "Saved online successfully" : "Saved locally, pending sync");
         autoDriveBackupIfEnabled();
       };
     });
@@ -4073,31 +4641,13 @@ function renderAgentsModule() {
         e.preventDefault();
         const payload = Object.fromEntries(new FormData(form).entries());
         try {
-          await crmFetch("/.netlify/functions/crm-agents", {
-            method: "POST",
-            body: JSON.stringify({ agent: payload }),
-          });
+          const result = await saveAgentToSupabase(payload);
           runtimeStore.crmAgents = await fetchCrmAgents();
           resetAgentForm();
           renderTab();
+          alert(result.status === "online" ? "Saved online successfully" : "Saved locally, pending sync");
         } catch (error) {
-          const current = Array.isArray(runtimeStore.crmAgents) ? [...runtimeStore.crmAgents] : [];
-          const localId = payload.id || `local_${Date.now()}_${Math.random().toString(16).slice(2, 7)}`;
-          const idx = current.findIndex((a) => String(a.id || "") === String(localId));
-          const localAgent = {
-            id: localId,
-            agent_code: payload.agentCode || localAgentCode(),
-            name: payload.name || "Agent",
-            email: payload.email || "",
-            phone: payload.phone || "",
-            role: payload.role || "agent",
-          };
-          if (idx >= 0) current[idx] = { ...current[idx], ...localAgent };
-          else current.unshift(localAgent);
-          runtimeStore.crmAgents = current;
-          resetAgentForm();
-          renderTab();
-          alert(`Agent saved locally (server unavailable): ${error.message}`);
+          alert(`Failed to save agent: ${error.message}`);
         }
       };
 
@@ -4571,7 +5121,8 @@ function renderServiceCatalog() {
       all[idx].description = String(obj.companyDescription || "").trim();
       saveCompanyProfiles(all);
       syncServicesCatalogFromProfiles(all);
-      alert("Company profile updated.");
+      const companyResult = await saveCompaniesToSupabase(all);
+      alert(companyResult.status === "online" ? "Saved online successfully" : "Saved locally, pending sync");
       autoDriveBackupIfEnabled();
       renderTab();
     };
@@ -4883,12 +5434,12 @@ function renderApplyNow() {
       const all = customers();
       all.push(obj);
       save(APP_KEYS.customers, all);
-      await saveApplicantsToServer(all);
+      const saveResult = await saveApplicantsToServer(all);
       const n = notifications();
       n.unshift({ at: new Date().toISOString(), text: `New apply-now request: ${obj.name} (${obj.appId})` });
       save(APP_KEYS.notifications, n);
       autoDriveBackupIfEnabled();
-      alert(`Submitted. Application ID: ${obj.appId}`);
+      alert(`${saveResult.status === "online" ? "Saved online successfully" : "Saved locally, pending sync"}. Application ID: ${obj.appId}`);
       form.reset();
     };
   }, 0);
@@ -5027,30 +5578,26 @@ refs.langToggle.addEventListener("click", () => {
 });
 
 async function initializeRuntimeData() {
-  try {
-    await fetch("/.netlify/functions/crm-bootstrap", {
-      method: "POST",
-      headers: { "x-app-role": "admin" },
-    });
-  } catch {
-    // App can still run with existing data if bootstrap is unreachable.
-  }
-  runtimeStore[APP_KEYS.settings] = { ...defaultSettings };
-  runtimeStore[APP_KEYS.notifications] = [];
-  runtimeStore[APP_KEYS.customTrades] = [];
-  runtimeStore[APP_KEYS.staff] = [];
-  runtimeStore[APP_KEYS.services] = defaultServicesCatalog();
-  runtimeStore[APP_KEYS.companyProfiles] = defaultCompanyProfiles();
-  runtimeStore[APP_KEYS.socialLinks] = [];
+  runtimeStore[APP_KEYS.settings] = { ...defaultSettings, ...safeStorageGet(APP_KEYS.settings, {}) };
+  runtimeStore[APP_KEYS.notifications] = safeStorageGet(APP_KEYS.notifications, []);
+  runtimeStore[APP_KEYS.customTrades] = safeStorageGet(APP_KEYS.customTrades, []);
+  runtimeStore[APP_KEYS.staff] = safeStorageGet(APP_KEYS.staff, []);
+  runtimeStore[APP_KEYS.services] = safeStorageGet(APP_KEYS.services, defaultServicesCatalog());
+  runtimeStore[APP_KEYS.companyProfiles] = safeStorageGet(APP_KEYS.companyProfiles, defaultCompanyProfiles());
+  runtimeStore[APP_KEYS.socialLinks] = safeStorageGet(APP_KEYS.socialLinks, []);
   runtimeStore[APP_KEYS.customers] = await fetchApplicantsFromServer();
   const crmRefs = await fetchCrmReferences();
   runtimeStore.crmCountries = crmRefs.countries;
   runtimeStore.crmCompanies = crmRefs.companies;
+  if (runtimeStore.crmCompanies.length) {
+    runtimeStore[APP_KEYS.companyProfiles] = mergeCompanyProfilesWithRemote(runtimeStore.crmCompanies);
+  }
   runtimeStore.crmAgents = await fetchCrmAgents();
   runtimeStore.crmJobs = await fetchCrmJobs();
   runtimeStore.crmDocuments = await fetchCrmDocuments();
   runtimeStore.crmPayments = await fetchCrmPayments();
   runtimeStore.crmReports = await fetchCrmReports();
+  await syncPendingSupabaseData();
 }
 
 async function bootApp() {
@@ -5074,6 +5621,10 @@ async function bootApp() {
   decorateFormFields(refs.loginCard);
   enhancePasswordInputs(refs.loginCard);
 }
+
+window.addEventListener("online", () => {
+  syncPendingSupabaseData().catch(() => {});
+});
 
 bootApp();
 
