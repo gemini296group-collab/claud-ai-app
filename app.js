@@ -1338,7 +1338,7 @@ async function crmFetch(path, init = {}) {
 
 async function fetchDashboardMetrics() {
   try {
-    const payload = await crmFetch("/ /crm-dashboard");
+    const payload = await crmFetch("/crm-dashboard");
     return payload.metrics || null;
   } catch {
     return null;
@@ -1515,7 +1515,7 @@ async function syncPendingSupabaseData() {
 
 async function fetchCrmJobs() {
   try {
-    const payload = await crmFetch("/ /crm-jobs");
+    const payload = await crmFetch("/crm-jobs");
     return Array.isArray(payload.jobs) ? payload.jobs : [];
   } catch {
     return [];
@@ -1524,7 +1524,7 @@ async function fetchCrmJobs() {
 
 async function fetchCrmDocuments() {
   try {
-    const payload = await crmFetch("/ /crm-documents");
+    const payload = await crmFetch("/crm-documents");
     return Array.isArray(payload.documents) ? payload.documents : [];
   } catch {
     return [];
@@ -1533,7 +1533,7 @@ async function fetchCrmDocuments() {
 
 async function fetchCrmPayments() {
   try {
-    const payload = await crmFetch("/ /crm-payments");
+    const payload = await crmFetch("/crm-payments");
     return Array.isArray(payload.payments) ? payload.payments : [];
   } catch {
     return [];
@@ -1542,7 +1542,7 @@ async function fetchCrmPayments() {
 
 async function fetchCrmReports() {
   try {
-    const payload = await crmFetch("/ /crm-reports");
+    const payload = await crmFetch("/crm-reports");
     return payload.reports || null;
   } catch {
     return null;
@@ -4727,7 +4727,7 @@ function renderJobDemandsModule() {
           payload.jobTitle = payload.jobTitleManual;
         }
         try {
-          await crmFetch("/ /crm-jobs", {
+          await crmFetch("/crm-jobs", {
             method: "POST",
             body: JSON.stringify({ job: payload }),
           });
@@ -4791,7 +4791,7 @@ function renderDocumentsModule() {
         e.preventDefault();
         const payload = Object.fromEntries(new FormData(form).entries());
         try {
-          await crmFetch("/ /crm-documents", {
+          await crmFetch("/crm-documents", {
             method: "POST",
             body: JSON.stringify(payload),
           });
@@ -4844,7 +4844,7 @@ function renderPaymentsModule() {
         e.preventDefault();
         const payload = Object.fromEntries(new FormData(form).entries());
         try {
-          await crmFetch("/ /crm-payments", {
+          await crmFetch("/crm-payments", {
             method: "POST",
             body: JSON.stringify(payload),
           });
