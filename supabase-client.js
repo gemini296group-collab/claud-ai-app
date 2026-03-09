@@ -1,8 +1,8 @@
 (function initAppSupabase(global) {
-  const config = global.__APP_CONFIG__ || {};
-  const supabaseUrl = String(config.SUPABASE_URL || config.supabaseUrl || "").trim();
-  const supabaseAnonKey = String(config.SUPABASE_ANON_KEY || config.supabaseAnonKey || "").trim();
-  let client = null;
+  var config = global.__APP_CONFIG__ || {};
+  var supabaseUrl = String(config.SUPABASE_URL || config.supabaseUrl || "").trim();
+  var supabaseAnonKey = String(config.SUPABASE_ANON_KEY || config.supabaseAnonKey || "").trim();
+  var client = null;
 
   function getClient() {
     if (client) return client;
@@ -23,12 +23,12 @@
   }
 
   global.appSupabase = {
-    getClient,
-    isReady() {
+    getClient: getClient,
+    isReady: function() {
       return !!getClient();
     },
     config: {
-      supabaseUrl,
+      supabaseUrl: supabaseUrl,
       configured: !!supabaseUrl && !!supabaseAnonKey,
     },
   };
