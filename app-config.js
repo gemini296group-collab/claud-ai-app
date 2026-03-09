@@ -1,4 +1,4 @@
 window.__APP_CONFIG__ = {
   SUPABASE_URL: "https://hhmwxxksbgcnlphoepbr.supabase.co",
-  SUPABASE_ANON_KEY: "sb_publishable_Yr1DdtDx0ULiK3wJhwMJvw_p0cSK6b5"
+  SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhobXd4a3hiZ2NubHBob2VwYnIiLCJyb2xlIjoiYW5vbiIsImlhdCI6MTc0MDc1MTM2OCwiZXhwIjoyMDU2MzI3MzY4fQ.4iLCJpYXQiOjE3NzI4OTEyMzYsImV4cCI6MjA4ODQ2NzIzNn0.LpObLYR6qXed2MMcGjd2U6AyzSUyFY2RcMJgqz-tmwE"
 };
