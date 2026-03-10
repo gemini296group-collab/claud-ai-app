@@ -1,0 +1,10 @@
+{
+  "rewrites": [
+    { "source": "/api/proxy/:path*", "destination": "/api/proxy" },
+    { "source": "/crm-dashboard", "destination": "/api/crm-dashboard" },
+    { "source": "/crm-jobs", "destination": "/api/crm-jobs" },
+    { "source": "/crm-payments", "destination": "/api/crm-payments" },
+    { "source": "/crm-reports", "destination": "/api/crm-reports" },
+    { "source": "/crm-documents", "destination": "/api/crm-documents" }
+  ]
+}
